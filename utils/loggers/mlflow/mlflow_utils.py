@@ -83,18 +83,6 @@ class MlflowLogger:
         else:
             self.mlflow.log_artifact(str(artifact.resolve()), artifact_path=relpath)
 
-    def log_model(self, model_path: Path, model_name: str = None) -> None:
-        """Member function to log model as an Mlflow model.
-
-        Args:
-            model_path: Path to the model .pt being logged
-            model_name: Name (or path) relative to experiment for logging model in mlflow
-        """
-        self.mlflow.pyfunc.log_model(artifact_path=self.model_name if model_name is None else model_name,
-                                     code_path=[str(ROOT.resolve())],
-                                     artifacts={"model_path": str(model_path.resolve())},
-                                     python_model=self.mlflow.pyfunc.PythonModel())
-
     def log_params(self, params: Dict[str, Any]) -> None:
         """Member funtion to log parameters.
         Mlflow doesn't have mutable parameters and so this function is used

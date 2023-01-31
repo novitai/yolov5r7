@@ -290,8 +290,6 @@ class Loggers():
                 self.clearml.task.update_output_model(model_path=str(last),
                                                       model_name='Latest Model',
                                                       auto_delete_file=False)
-            if self.mlflow:
-                self.mlflow.log_model(model_path=last, model_name=f"{self.mlflow.model_name}/last/{epoch}")
 
         if self.comet_logger:
             self.comet_logger.on_model_save(last, epoch, final_epoch, best_fitness, fi)
@@ -323,10 +321,6 @@ class Loggers():
             # log stuff
             [self.mlflow.log_artifacts(f, "results") for f in files if f.exists()]
             self.mlflow.log_artifacts(self.save_dir / "results.csv", "results")
-            if last.exists():
-                self.mlflow.log_model(model_path=last, model_name=f"{self.mlflow.model_name}/last/{epoch}")
-            if best.exists():
-                self.mlflow.log_model(model_path=best, model_name=f"{self.mlflow.model_name}/best/{epoch}")
             self.mlflow.finish_run()
 
         if self.clearml and not self.opt.evolve:
@@ -427,9 +421,6 @@ class GenericLogger:
             art = wandb.Artifact(name=f"run_{wandb.run.id}_model", type="model", metadata=metadata)
             art.add_file(str(model_path))
             wandb.log_artifact(art)
-
-        if self.mlflow:
-            self.mlflow.log_model(model_path=model_path, model_name=f"{self.mlflow.model_name}/{epoch}")
 
     def update_params(self, params):
         # Update the paramters logged
