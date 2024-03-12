@@ -35,7 +35,8 @@ class MlflowLogger:
         """
         prefix = colorstr("Mlflow: ")
         try:
-            self.mlflow, self.mlflow_active_run = mlflow, None if not mlflow else mlflow.start_run()
+            mlflow.set_experiment(opt.name)
+            self.mlflow, self.mlflow_active_run = mlflow, None if not mlflow else mlflow.start_run(run_name=opt.save_dir)
             if self.mlflow_active_run is not None:
                 self.run_id = self.mlflow_active_run.info.run_id
                 LOGGER.info(f"{prefix}Using run_id({self.run_id})")
