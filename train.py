@@ -25,6 +25,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -102,6 +103,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         data_dict = loggers.remote_dataset
         if resume:  # If resuming runs from remote artifact
             weights, epochs, hyp, batch_size = opt.weights, opt.epochs, opt.hyp, opt.batch_size
+
+    # MLflow hyperparameter logging
+    for opt_key in opt.__dict__:
+        opt_value = opt.__dict__[opt_key]
+        if opt_value is not None and opt_value != "":
+            if opt_key == "hyp":
+                for hyp_key, hyp_val in opt_value.items():
+                    mlflow.log_param(hyp_key, hyp_val)
+            else:
+                mlflow.log_param(opt_key, opt_value)
 
     # Config
     plots = not evolve and not opt.noplots  # create plots
@@ -366,6 +377,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+
+            # Logging error parameters to mlflow
+            mlflow.log_metric("Precision", results[0], step=epoch)
+            mlflow.log_metric("Recall", results[1], step=epoch)
+            mlflow.log_metric("mAP.5", results[2], step=epoch)
+            mlflow.log_metric("mAP.5-95", results[3], step=epoch)
+            mloss_cpu = mloss.cpu().numpy()
+            mlflow.log_metric("BOX Loss", mloss_cpu[0], step=epoch)
+            mlflow.log_metric("OBJ Loss", mloss_cpu[1], step=epoch)
+            mlflow.log_metric("CLS Loss", mloss_cpu[2], step=epoch)
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
