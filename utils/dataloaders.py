@@ -3,6 +3,10 @@
 Dataloaders and dataset utils
 """
 
+
+import gi
+
+gi.require_version('Gst', '1.0')
 import contextlib
 import glob
 import hashlib
@@ -11,6 +15,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 from itertools import repeat
 from multiprocessing.pool import Pool, ThreadPool
@@ -24,6 +29,7 @@ import torch
 import torch.nn.functional as F
 import torchvision
 import yaml
+from gi.repository import Gst
 from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
@@ -334,6 +340,352 @@ class LoadImages:
 
     def __len__(self):
         return self.nf  # number of files
+
+
+Gst.init(None)
+
+
+def create_element(factory_name: str, name: str) -> Gst.Element:
+    element = Gst.ElementFactory.make(factory_name, name)
+    if not element:
+        print(f'Failed to create element {name}')
+        sys.exit(1)
+    return element
+
+
+def link_elements(elements: list) -> bool:
+    for i in range(len(elements) - 1):
+        if not Gst.Element.link(elements[i], elements[i + 1]):
+            print(f'Failed to link {elements[i].name} to {elements[i + 1].name}')
+            return False
+    return True
+
+
+class JetsonCameraStreamLoader:
+    def __init__(self, img_size=640, stride=32, auto=True, transforms=None):
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.transforms = transforms
+
+        self.sources = ['Jetson Camera']
+        self.mode = 'stream'
+
+        self.pipeline = None
+        self.stopped = False
+
+        self.build_pipeline()
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+
+    def build_pipeline(self):
+        pipeline = Gst.Pipeline()
+
+        source = create_element('nvarguscamerasrc', 'source')
+        capsfilter = create_element('capsfilter', 'capsfilter')
+        capsfilter.set_property('caps', Gst.Caps.from_string(
+            'video/x-raw(memory:NVMM),width=1920,height=1080,format=NV12,framerate=30/1'))
+
+        tee = create_element('tee', 'tee')
+        queue1 = create_element('queue', 'queue1')
+        queue1.set_property('leaky', 2)
+        queue1.set_property('max-size-buffers', 1)
+        queue1.set_property('max-size-bytes', 0)
+        queue1.set_property('max-size-time', 0)
+
+        nvvidconv = create_element('nvvidconv', 'nvvidconv')
+        capsfilter2 = create_element('capsfilter', 'capsfilter2')
+        capsfilter2.set_property('caps', Gst.Caps.from_string('video/x-raw, format=RGBA'))
+
+        appsink = create_element('appsink', 'appsink')
+        appsink.set_property('emit-signals', False)
+        appsink.set_property('sync', False)
+        appsink.set_property('drop', False)
+        appsink.set_property('max-buffers', 1)
+        appsink.set_property('wait-on-eos', False)
+        appsink.set_property('enable-last-sample', False)
+
+        queue2 = create_element('queue', 'queue2')
+        queue2.set_property('leaky', 2)
+        queue2.set_property('max-size-buffers', 1)
+        queue2.set_property('max-size-bytes', 0)
+        queue2.set_property('max-size-time', 0)
+
+        encoder = create_element('nvv4l2h264enc', 'encoder')
+        encoder.set_property('bitrate', 8000000)
+        encoder.set_property('insert-sps-pps', True)
+        encoder.set_property('maxperf-enable', True)
+        encoder.set_property('preset-level', 1)
+        encoder.set_property('control-rate', 1)
+
+        h264parse = create_element('h264parse', 'h264parse')
+        rtsp_sink = create_element('rtspclientsink', 'rtsp_sink')
+        rtsp_sink.set_property('location', 'rtsp://redirect-rtsp:8554/main_cam')
+        rtsp_sink.set_property('protocols', 'tcp')
+
+        elements = [
+            source, capsfilter, tee,
+            queue1, nvvidconv, capsfilter2, appsink,
+            queue2, encoder, h264parse, rtsp_sink
+        ]
+
+        for elem in elements:
+            if not elem:
+                print(f"Failed to create element {elem.get_name()}")
+                sys.exit(1)
+            pipeline.add(elem)
+
+        if not link_elements([source, capsfilter, tee]):
+            print("Failed to link main pipeline elements")
+            sys.exit(1)
+
+        tee_pad1 = tee.get_request_pad('src_%u')
+        queue1_pad = queue1.get_static_pad('sink')
+        if tee_pad1.link(queue1_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue1')
+            sys.exit(1)
+        if not link_elements([queue1, nvvidconv, capsfilter2, appsink]):
+            print("Failed to link appsink branch")
+            sys.exit(1)
+
+        tee_pad2 = tee.get_request_pad('src_%u')
+        queue2_pad = queue2.get_static_pad('sink')
+        if tee_pad2.link(queue2_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue2')
+            sys.exit(1)
+        if not link_elements([queue2, encoder, h264parse, rtsp_sink]):
+            print("Failed to link RTSP branch")
+            sys.exit(1)
+
+        self.pipeline = pipeline
+
+    def on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("End-Of-Stream reached")
+            self.stopped = True
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"Error received from element {message.src.get_name()}: {err.message}")
+            print(f"Debugging information: {debug if debug else 'None'}")
+            self.stopped = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+
+        while True:
+            message = self.bus.timed_pop_filtered(0, Gst.MessageType.ANY)
+            if not message:
+                break
+            self.on_bus_message(self.bus, message)
+
+        appsink = self.pipeline.get_by_name('appsink')
+        sample = appsink.emit('pull-sample')
+
+        if not sample:
+            self.stopped = True
+            raise StopIteration
+
+        buffer = sample.get_buffer()
+        caps_format = sample.get_caps().get_structure(0)
+        width = caps_format.get_value('width')
+        height = caps_format.get_value('height')
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if success:
+            frame_data = bytes(map_info.data)
+            buffer.unmap(map_info)
+            frame = np.frombuffer(frame_data, np.uint8).reshape((height, width, 4))
+            im0 = frame[..., :3]
+            if self.transforms:
+                im = self.transforms(im0)
+            else:
+                im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+                im = im[..., :3]
+                im = im[..., ::-1].transpose((2, 0, 1))
+            im = np.ascontiguousarray(im)
+            im0 = [im0[..., ::-1]]
+            return self.sources, im, im0, None, ''
+        else:
+            self.stopped = True
+            raise StopIteration
+
+    def __len__(self):
+        return len(self.sources)
+
+    def stop(self):
+        self.stopped = True
+        self.pipeline.set_state(Gst.State.NULL)
+
+
+class ZEDXStreamLoader:
+    def __init__(self, img_size=640, stride=32, auto=True, transforms=None):
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.transforms = transforms
+
+        self.sources = ['ZEDX camera']
+        self.mode = 'stream'
+
+        self.pipeline = None
+        self.stopped = False
+
+        self.build_pipeline()
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+
+    def build_pipeline(self):
+        pipeline = Gst.Pipeline()
+
+        source = create_element('zedxonesrc', 'source')
+
+        capsfilter = create_element('capsfilter', 'capsfilter')
+        capsfilter.set_property('caps', Gst.Caps.from_string('video/x-raw, format=BGRA'))
+        tee = create_element('tee', 'tee')
+
+        queue_appsink = create_element('queue', 'queue_appsink')
+        queue_rtsp = create_element('queue', 'queue_rtsp')
+
+        for queue in [queue_appsink, queue_rtsp]:
+            queue.set_property('leaky', 2)
+            queue.set_property('max-size-buffers', 1)
+            queue.set_property('max-size-bytes', 0)
+            queue.set_property('max-size-time', 0)
+
+        vidconv = create_element('videoconvert', 'vidconv')
+        nvvidconv = create_element('nvvidconv', 'nvvidconv')
+        capsfilter2 = create_element('capsfilter', 'capsfilter2')
+        capsfilter2.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM), format=NV12'))
+
+        encoder = create_element('nvv4l2h265enc', 'encoder')
+        encoder.set_property('bitrate', 8000000)
+        encoder.set_property('iframeinterval', 15)
+        encoder.set_property('insert-sps-pps', True)
+        encoder.set_property('maxperf-enable', True)
+        encoder.set_property('preset-level', 1)
+        encoder.set_property('control-rate', 1)
+
+        parser = create_element('h265parse', 'parser')
+
+        rtsp_sink = create_element('rtspclientsink', 'rtsp_sink')
+        rtsp_sink.set_property('protocols', 'tcp')
+        rtsp_sink.set_property('location', 'rtsp://redirect-rtsp:8554/main_cam')
+
+        appsink = create_element('appsink', 'appsink')
+        appsink.set_property('emit-signals', False)
+        appsink.set_property('sync', False)
+        appsink.set_property('max-buffers', 1)
+        appsink.set_property('drop', True)
+        appsink.set_property('wait-on-eos', False)
+        appsink.set_property('enable-last-sample', False)
+
+        elements = [
+            source, capsfilter, tee,
+            queue_rtsp, vidconv, nvvidconv, capsfilter2, encoder, parser, rtsp_sink,
+            queue_appsink, appsink
+        ]
+        for elem in elements:
+            if not elem:
+                print('Failed to create an element.')
+                sys.exit(1)
+            pipeline.add(elem)
+
+        if not link_elements([source, capsfilter, tee]):
+            print('Failed to link source to tee.')
+            sys.exit(1)
+
+        tee_pad1 = tee.get_request_pad('src_%u')
+        queue_rtsp_pad = queue_rtsp.get_static_pad('sink')
+        if tee_pad1.link(queue_rtsp_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue_rtsp')
+            sys.exit(1)
+        if not link_elements([queue_rtsp, vidconv, nvvidconv, capsfilter2, encoder, parser, rtsp_sink]):
+            print('Failed to link RTSP branch.')
+            sys.exit(1)
+
+        tee_pad2 = tee.get_request_pad('src_%u')
+        queue_appsink_pad = queue_appsink.get_static_pad('sink')
+        if tee_pad2.link(queue_appsink_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue_appsink')
+            sys.exit(1)
+        if not link_elements([queue_appsink, appsink]):
+            print('Failed to link appsink branch.')
+            sys.exit(1)
+
+        self.pipeline = pipeline
+
+    def on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("End-Of-Stream reached")
+            self.stopped = True
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"Error received from element {message.src.get_name()}: {err.message}")
+            print(f"Debugging information: {debug if debug else 'None'}")
+            self.stopped = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+
+        while True:
+            message = self.bus.timed_pop_filtered(0, Gst.MessageType.ANY)
+            if not message:
+                break
+            self.on_bus_message(self.bus, message)
+
+        appsink = self.pipeline.get_by_name('appsink')
+        sample = appsink.emit('pull-sample')
+
+        if sample is None:
+            self.stopped = True
+            raise StopIteration
+
+        buffer = sample.get_buffer()
+        caps_format = sample.get_caps().get_structure(0)
+        width = caps_format.get_value('width')
+        height = caps_format.get_value('height')
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if success:
+            frame_data = bytes(map_info.data)
+            buffer.unmap(map_info)
+            frame = np.frombuffer(frame_data, np.uint8).reshape((height, width, 4))  # BGRA format
+            im0 = frame[..., :3]
+            if self.transforms:
+                im = self.transforms(im0)
+            else:
+                im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+                im = im[..., :3]
+                im = im[..., ::-1].transpose((2, 0, 1))  # BGR to RGB, HWC to CHW
+            im = np.ascontiguousarray(im)
+            im0 = [im0]
+            return self.sources, im, im0, None, ''
+        else:
+            self.stopped = True
+            raise StopIteration
+
+    def __len__(self):
+        return len(self.sources)
+
+    def stop(self):
+        self.stopped = True
+        self.pipeline.set_state(Gst.State.NULL)
 
 
 class LoadStreams:
