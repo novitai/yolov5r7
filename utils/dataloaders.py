@@ -3,6 +3,13 @@
 Dataloaders and dataset utils
 """
 
+import datetime
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+import queue
+import sys
+from typing import Any, List, Optional
 import contextlib
 import glob
 import hashlib
@@ -34,6 +41,7 @@ from utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, c
                            check_yaml, clean_str, cv2, is_colab, is_kaggle, segments2boxes, unzip_file, xyn2xy,
                            xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
 from utils.torch_utils import torch_distributed_zero_first
+
 
 # Parameters
 HELP_URL = 'See https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
@@ -335,6 +343,432 @@ class LoadImages:
     def __len__(self):
         return self.nf  # number of files
 
+
+Gst.init(None)
+
+def create_element(factory_name: str, name: str) -> Gst.Element:
+    element = Gst.ElementFactory.make(factory_name, name)
+    if not element:
+        print(f'Failed to create element {name}')
+        sys.exit(1)
+    return element
+
+def link_elements(elements: list) -> bool:
+    for i in range(len(elements) - 1):
+        if not Gst.Element.link(elements[i], elements[i + 1]):
+            print(f'Failed to link {elements[i].name} to {elements[i + 1].name}')
+            return False
+    return True
+
+class JetsonCameraStreamLoader:
+    def __init__(self, img_size=640, stride=32, auto=True, transforms=None):
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.transforms = transforms
+
+        self.sources = ['Jetson Camera']
+        self.mode = 'stream'
+
+        self.pipeline = None
+        self.stopped = False
+
+        self.build_pipeline()
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+
+    def build_pipeline(self):
+        pipeline = Gst.Pipeline()
+
+        source = create_element('nvarguscamerasrc', 'source')
+        capsfilter = create_element('capsfilter', 'capsfilter')
+        capsfilter.set_property('caps', Gst.Caps.from_string(
+            'video/x-raw(memory:NVMM),width=1920,height=1080,format=NV12,framerate=30/1'))
+
+        tee = create_element('tee', 'tee')
+        queue1 = create_element('queue', 'queue1')
+        queue1.set_property('leaky', 2)
+        queue1.set_property('max-size-buffers', 1)
+        queue1.set_property('max-size-bytes', 0)
+        queue1.set_property('max-size-time', 0)
+
+        nvvidconv = create_element('nvvidconv', 'nvvidconv')
+        capsfilter2 = create_element('capsfilter', 'capsfilter2')
+        capsfilter2.set_property('caps', Gst.Caps.from_string('video/x-raw, format=RGBA'))
+
+        appsink = create_element('appsink', 'appsink')
+        appsink.set_property('emit-signals', False)
+        appsink.set_property('sync', False)
+        appsink.set_property('drop', False)
+        appsink.set_property('max-buffers', 1)
+        appsink.set_property('wait-on-eos', False)
+        appsink.set_property('enable-last-sample', False)
+
+        queue2 = create_element('queue', 'queue2')
+        queue2.set_property('leaky', 2)
+        queue2.set_property('max-size-buffers', 1)
+        queue2.set_property('max-size-bytes', 0)
+        queue2.set_property('max-size-time', 0)
+
+        encoder = create_element('nvv4l2h264enc', 'encoder')
+        encoder.set_property('bitrate', 8000000)
+        encoder.set_property('insert-sps-pps', True)
+        encoder.set_property('maxperf-enable', True)
+        encoder.set_property('preset-level', 1)
+        encoder.set_property('control-rate', 1)
+
+        h264parse = create_element('h264parse', 'h264parse')
+        rtsp_sink = create_element('rtspclientsink', 'rtsp_sink')
+        rtsp_sink.set_property('location', 'rtsp://redirect-rtsp:8554/main_cam')
+        rtsp_sink.set_property('protocols', 'tcp')
+
+        elements = [
+            source, capsfilter, tee,
+            queue1, nvvidconv, capsfilter2,  appsink,
+            queue2, encoder, h264parse, rtsp_sink
+        ]
+
+        for elem in elements:
+            if not elem:
+                print(f"Failed to create element {elem.get_name()}")
+                sys.exit(1)
+            pipeline.add(elem)
+
+        # Link elements in the main pipeline
+        if not link_elements([source, capsfilter, tee]):
+            print("Failed to link main pipeline elements")
+            sys.exit(1)
+
+        # Link tee to queue1 (appsink branch)
+        tee_pad1 = tee.get_request_pad('src_%u')
+        queue1_pad = queue1.get_static_pad('sink')
+        if tee_pad1.link(queue1_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue1')
+            sys.exit(1)
+        if not link_elements([queue1, nvvidconv, capsfilter2, appsink]):
+            print("Failed to link appsink branch")
+            sys.exit(1)
+
+        # Link tee to queue2 (RTSP branch)
+        tee_pad2 = tee.get_request_pad('src_%u')
+        queue2_pad = queue2.get_static_pad('sink')
+        if tee_pad2.link(queue2_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue2')
+            sys.exit(1)
+        if not link_elements([queue2, encoder, h264parse, rtsp_sink]):
+            print("Failed to link RTSP branch")
+            sys.exit(1)
+
+        self.pipeline = pipeline
+
+    def on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("End-Of-Stream reached")
+            self.stopped = True
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"Error received from element {message.src.get_name()}: {err.message}")
+            print(f"Debugging information: {debug if debug else 'None'}")
+            self.stopped = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+
+        while True:
+            message = self.bus.timed_pop_filtered(0, Gst.MessageType.ANY)
+            if not message:
+                break
+            self.on_bus_message(self.bus, message)
+
+        appsink = self.pipeline.get_by_name('appsink')
+        sample = appsink.emit('pull-sample')
+
+        if not sample:
+            self.stopped = True
+            raise StopIteration
+
+        buffer = sample.get_buffer()
+        caps_format = sample.get_caps().get_structure(0)
+        width = caps_format.get_value('width')
+        height = caps_format.get_value('height')
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if success:
+            frame_data = bytes(map_info.data)
+            buffer.unmap(map_info)
+            frame = np.frombuffer(frame_data, np.uint8).reshape((height, width, 4))
+            im0 = frame[..., :3]
+            if self.transforms:
+                im = self.transforms(im0)
+            else:
+                im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+                im = im[..., :3] 
+                im = im[..., ::-1].transpose((2, 0, 1))
+            im = np.ascontiguousarray(im)
+            im0 = [im0[..., ::-1]]
+            return self.sources, im, im0, None, ''
+        else:
+            self.stopped = True
+            raise StopIteration
+
+    def __len__(self):
+        return len(self.sources)
+
+    def stop(self):
+        self.stopped = True
+        self.pipeline.set_state(Gst.State.NULL)
+
+
+class ZEDXStreamLoader:
+    def __init__(self, img_size=640, stride=32, auto=True, transforms=None):
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.transforms = transforms
+
+        self.sources = ['ZEDX camera']
+        self.mode = 'stream'
+
+        self.pipeline = None
+        self.stopped = False
+
+        # Build the GStreamer pipeline
+        self.build_pipeline()
+
+        # Set pipeline to playing
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        # Create the bus and set up message handling
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+        
+    def build_pipeline(self):
+        pipeline = Gst.Pipeline()
+
+        source = create_element('zedxonesrc', 'source')
+
+        capsfilter = create_element('capsfilter', 'capsfilter')
+        capsfilter.set_property('caps', Gst.Caps.from_string('video/x-raw, format=BGRA'))
+        tee = create_element('tee', 'tee')
+
+        queue_appsink = create_element('queue', 'queue_appsink')
+        queue_rtsp = create_element('queue', 'queue_rtsp')
+
+        for queue in [queue_appsink, queue_rtsp]:
+            queue.set_property('leaky', 2)
+            queue.set_property('max-size-buffers', 1)
+            queue.set_property('max-size-bytes', 0)
+            queue.set_property('max-size-time', 0)
+
+        vidconv = create_element('videoconvert', 'vidconv')
+        nvvidconv = create_element('nvvidconv', 'nvvidconv')
+        capsfilter2 = create_element('capsfilter', 'capsfilter2')
+        capsfilter2.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM), format=NV12'))
+
+        encoder = create_element('nvv4l2h265enc', 'encoder')
+        encoder.set_property('bitrate', 8000000)
+        encoder.set_property('iframeinterval', 15)
+        encoder.set_property('insert-sps-pps', True)
+        encoder.set_property('maxperf-enable', True)
+        encoder.set_property('preset-level', 1)  # Ultra-fast preset
+        encoder.set_property('control-rate', 1)  # Variable bitrate
+
+        parser = create_element('h265parse', 'parser')
+
+        rtsp_sink = create_element('rtspclientsink', 'rtsp_sink')
+        rtsp_sink.set_property('protocols', 'tcp')
+        rtsp_sink.set_property('location', 'rtsp://redirect-rtsp:8554/main_cam')
+
+        # Appsink Branch
+        appsink = create_element('appsink', 'appsink')
+        appsink.set_property('emit-signals', False)
+        appsink.set_property('sync', False)
+        appsink.set_property('max-buffers', 1)
+        appsink.set_property('drop', True)
+        appsink.set_property('wait-on-eos', False)
+        appsink.set_property('enable-last-sample', False)
+
+        # Add elements to pipeline
+        elements = [
+            source, capsfilter, tee,
+            queue_rtsp, vidconv, nvvidconv, capsfilter2, encoder, parser, rtsp_sink,
+            queue_appsink, appsink
+        ]
+        for elem in elements:
+            if not elem:
+                print('Failed to create an element.')
+                sys.exit(1)
+            pipeline.add(elem)
+
+        # Link elements
+        if not link_elements([source, capsfilter, tee]):
+            print('Failed to link source to tee.')
+            sys.exit(1)
+
+        # Link tee to RTSP branch
+        tee_pad1 = tee.get_request_pad('src_%u')
+        queue_rtsp_pad = queue_rtsp.get_static_pad('sink')
+        if tee_pad1.link(queue_rtsp_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue_rtsp')
+            sys.exit(1)
+        if not link_elements([queue_rtsp, vidconv, nvvidconv, capsfilter2, encoder, parser, rtsp_sink]):
+            print('Failed to link RTSP branch.')
+            sys.exit(1)
+
+        # Link tee to appsink branch
+        tee_pad2 = tee.get_request_pad('src_%u')
+        queue_appsink_pad = queue_appsink.get_static_pad('sink')
+        if tee_pad2.link(queue_appsink_pad) != Gst.PadLinkReturn.OK:
+            print('Failed to link tee to queue_appsink')
+            sys.exit(1)
+        if not link_elements([queue_appsink, appsink]):
+            print('Failed to link appsink branch.')
+            sys.exit(1)
+
+        self.pipeline = pipeline
+
+    def on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("End-Of-Stream reached")
+            self.stopped = True
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"Error received from element {message.src.get_name()}: {err.message}")
+            print(f"Debugging information: {debug if debug else 'None'}")
+            self.stopped = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+
+        while True:
+            message = self.bus.timed_pop_filtered(0, Gst.MessageType.ANY)
+            if not message:
+                break
+            self.on_bus_message(self.bus, message)
+
+        appsink = self.pipeline.get_by_name('appsink')
+        sample = appsink.emit('pull-sample')
+
+        if sample is None:
+            self.stopped = True
+            raise StopIteration
+
+        buffer = sample.get_buffer()
+        caps_format = sample.get_caps().get_structure(0)
+        width = caps_format.get_value('width')
+        height = caps_format.get_value('height')
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if success:
+            frame_data = bytes(map_info.data)
+            buffer.unmap(map_info)
+            frame = np.frombuffer(frame_data, np.uint8).reshape((height, width, 4))  # BGRA format
+            im0 = frame[..., :3]
+            if self.transforms:
+                im = self.transforms(im0)
+            else:
+                im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+                im = im[..., :3]
+                im = im[..., ::-1].transpose((2, 0, 1))  # BGR to RGB, HWC to CHW
+            im = np.ascontiguousarray(im)
+            im0 = [im0]
+            return self.sources, im, im0, None, ''
+        else:
+            self.stopped = True
+            raise StopIteration
+
+    def __len__(self):
+        return len(self.sources)
+
+    def stop(self):
+        self.stopped = True
+        self.pipeline.set_state(Gst.State.NULL)
+
+
+class LoadStreams:
+    # Stream loader using GStreamer pipeline
+    def __init__(self, sources='streams.txt', img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
+        import torch
+        torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
+        self.mode = 'stream'
+        self.img_size = img_size
+        self.stride = stride
+        self.vid_stride = vid_stride
+        sources = Path(sources).read_text().splitlines() if os.path.isfile(sources) else [sources]
+        sources = [clean_str(x) for x in sources]
+        n = len(sources)
+        self.sources = sources
+        self.imgs, self.fps, self.frames, self.threads = [None] * n, [30] * n, [float('inf')] * n, [None] * n
+        self.pipelines = [None] * n  # GStreamerPipeline instances
+
+        for i, s in enumerate(sources):
+            st = f'{i + 1}/{n}: {s}... '
+            pipeline = GStreamerPipeline(rtsp_url=s)
+            pipeline.start()
+            self.pipelines[i] = pipeline
+            frame = pipeline.read()
+            if frame is None:
+                LOGGER.error(f'{st}Failed to read from pipeline')
+                sys.exit(1)
+            self.imgs[i] = frame
+            self.threads[i] = Thread(target=self.update, args=(i, pipeline), daemon=True)
+            LOGGER.info(f"{st}Success ({self.frames[i]} frames at {self.fps[i]:.2f} FPS)")
+            self.threads[i].start()
+
+        # Check for common shapes
+        s = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
+        self.rect = np.unique(s, axis=0).shape[0] == 1
+        self.auto = auto and self.rect
+        self.transforms = transforms
+        if not self.rect:
+            LOGGER.warning('WARNING: Stream shapes differ. For optimal performance, supply similarly-shaped streams.')
+
+    def update(self, i, pipeline):
+        # Read frames from the pipeline
+        while pipeline.running:
+            frame = pipeline.read()
+            if frame is not None:
+                self.imgs[i] = frame
+            else:
+                LOGGER.warning('WARNING: Video stream unresponsive.')
+                self.imgs[i] = np.zeros_like(self.imgs[i])
+            time.sleep(0.01)  # Sleep to reduce CPU usage
+
+    def __iter__(self):
+        self.count = -1
+        return self
+
+    def __next__(self):
+        self.count += 1
+        if not all(x.running for x in self.pipelines):
+            raise StopIteration
+
+        im0 = self.imgs.copy()
+        if self.transforms:
+            im = np.stack([self.transforms(x) for x in im0])
+        else:
+            im = np.stack([letterbox(x, self.img_size, stride=self.stride, auto=self.auto)[0] for x in im0])
+            im = im[..., :3]  # Remove alpha channel if present
+            im = im[..., ::-1].transpose((0, 3, 1, 2))  # BGRA/BGR to RGB, BHWC to BCHW
+            im = np.ascontiguousarray(im)
+
+        return self.sources, im, im0, None, ''
+
+    def __len__(self):
+        return len(self.sources)
 
 class LoadStreams:
     # YOLOv5 streamloader, i.e. `python detect.py --source 'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP streams`
