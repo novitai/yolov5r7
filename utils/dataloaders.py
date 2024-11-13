@@ -645,40 +645,48 @@ class ZEDXStreamLoader:
             raise StopIteration
 
         while True:
-            message = self.bus.timed_pop_filtered(0, Gst.MessageType.ANY)
-            if not message:
-                break
-            self.on_bus_message(self.bus, message)
+            try:
+                message = self.bus.timed_pop_filtered(0, Gst.MessageType.ANY)
+                if not message:
+                    break
+                self.on_bus_message(self.bus, message)
 
-        appsink = self.pipeline.get_by_name('appsink')
-        sample = appsink.emit('pull-sample')
+                appsink = self.pipeline.get_by_name('appsink')
+                sample = appsink.emit('pull-sample')
 
-        if sample is None:
-            self.stopped = True
-            raise StopIteration
+                if sample is None:
+                    self.stopped = True
+                    raise StopIteration
 
-        buffer = sample.get_buffer()
-        caps_format = sample.get_caps().get_structure(0)
-        width = caps_format.get_value('width')
-        height = caps_format.get_value('height')
-        success, map_info = buffer.map(Gst.MapFlags.READ)
-        if success:
-            frame_data = bytes(map_info.data)
-            buffer.unmap(map_info)
-            frame = np.frombuffer(frame_data, np.uint8).reshape((height, width, 4))  # BGRA format
-            im0 = frame[..., :3]
-            if self.transforms:
-                im = self.transforms(im0)
-            else:
-                im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
-                im = im[..., :3]
-                im = im[..., ::-1].transpose((2, 0, 1))  # BGR to RGB, HWC to CHW
-            im = np.ascontiguousarray(im)
-            im0 = [im0]
-            return self.sources, im, im0, None, ''
-        else:
-            self.stopped = True
-            raise StopIteration
+                buffer = sample.get_buffer()
+                caps_format = sample.get_caps().get_structure(0)
+                width = caps_format.get_value('width')
+                height = caps_format.get_value('height')
+
+                success, map_info = buffer.map(Gst.MapFlags.READ)
+                if success:
+                    frame_data = bytes(map_info.data)
+                    buffer.unmap(map_info)
+                    frame = np.frombuffer(frame_data, np.uint8).reshape((height, width, 4))  # BGRA format
+                    im0 = frame[..., :3]
+
+                    if self.transforms:
+                        im = self.transforms(im0)
+                    else:
+                        im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+                    im = im[..., :3]
+                    im = im[..., ::-1].transpose((2, 0, 1))  # BGR to RGB, HWC to CHW
+                    im = np.ascontiguousarray(im)
+                    im0 = [im0]
+
+                    return self.sources, im, im0, None, ''
+                else:
+                    print("Failed to map buffer for frame.")
+                    return self.sources, None, None, None, ''
+            except Exception as e:
+                print(f"Error while processing frame: {e}")
+                return self.sources, None, None, None, ''
+
 
     def __len__(self):
         return len(self.sources)
