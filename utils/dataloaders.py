@@ -550,7 +550,7 @@ class ZEDXStreamLoader:
         pipeline = Gst.Pipeline()
 
         source = create_element('zedxonesrc', 'source')
-
+        source.set_property('camera-timeout', 30000)
         capsfilter = create_element('capsfilter', 'capsfilter')
         capsfilter.set_property('caps', Gst.Caps.from_string('video/x-raw, format=BGRA'))
         tee = create_element('tee', 'tee')
