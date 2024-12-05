@@ -570,8 +570,8 @@ class ZEDXStreamLoader:
         capsfilter2.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM), format=NV12'))
 
         encoder = create_element('nvv4l2h265enc', 'encoder')
-        encoder.set_property('bitrate', 8000000)
-        encoder.set_property('iframeinterval', 15)
+        encoder.set_property('bitrate', 100000)
+        encoder.set_property('iframeinterval', 120)
         encoder.set_property('insert-sps-pps', True)
         encoder.set_property('maxperf-enable', True)
         encoder.set_property('preset-level', 1)
